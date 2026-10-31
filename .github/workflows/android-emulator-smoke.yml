@@ -1,0 +1,130 @@
+name: Android Emulator Smoke
+
+# LearnHarness Android v1 smoke: build the release APK exactly like the
+# Android APK workflow, then launch it in a KVM-enabled emulator on a
+# GitHub-hosted runner and capture logcat. Manual trigger only.
+# It never publishes anything; it only reports whether the app stays
+# alive and, if it dies, the crash log. A DEAD verdict fails the run
+# on purpose. Verdict comes from logcat and process liveness, not from
+# build success alone.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter 3.47.7
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.7"
+
+      - name: Install dependencies
+        working-directory: android
+        run: flutter pub get
+
+      - name: Analyze
+        working-directory: android
+        run: flutter analyze
+
+      - name: Test
+        working-directory: android
+        run: flutter test
+
+      - name: Build release APK
+        working-directory: android
+        run: flutter build apk --release
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: learnharness-android-apk
+          path: android/build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Write emulator test script
+        run: |
+          cat > "$GITHUB_WORKSPACE/smoke-test.sh" <<'SMOKE_EOF'
+          #!/bin/sh
+          set +e
+          APK="$GITHUB_WORKSPACE/android/build/app/outputs/flutter-apk/app-release.apk"
+          PKG="com.darrenlabs.learnharness_android"
+          adb logcat -c
+          adb install -r "$APK"
+          INSTALL_EXIT=$?
+          echo "install exit: $INSTALL_EXIT"
+          if [ "$INSTALL_EXIT" -ne 0 ]; then
+            echo "INSTALL_FAILED" > "$GITHUB_WORKSPACE/smoke-verdict.txt"
+            adb logcat -b crash -d > "$GITHUB_WORKSPACE/logcat-crash.txt" || true
+            adb logcat -d | grep -E "learnharness|FATAL|AndroidRuntime" > "$GITHUB_WORKSPACE/logcat-app.txt" || true
+            exit 1
+          fi
+          adb shell am start -n "$PKG/.MainActivity"
+          sleep 30
+          if adb shell pidof "$PKG" >/dev/null 2>&1; then
+            echo "ALIVE" > "$GITHUB_WORKSPACE/smoke-verdict.txt"
+          else
+            echo "DEAD" > "$GITHUB_WORKSPACE/smoke-verdict.txt"
+          fi
+          adb logcat -b crash -d > "$GITHUB_WORKSPACE/logcat-crash.txt" || true
+          adb logcat -d | grep -E "learnharness|FATAL|AndroidRuntime|Displayed" > "$GITHUB_WORKSPACE/logcat-app.txt" || true
+          echo "=== VERDICT ==="
+          cat "$GITHUB_WORKSPACE/smoke-verdict.txt"
+          echo "=== CRASH BUFFER ==="
+          cat "$GITHUB_WORKSPACE/logcat-crash.txt"
+          echo "=== APP LOGCAT MATCHES ==="
+          head -100 "$GITHUB_WORKSPACE/logcat-app.txt"
+          if grep -q "DEAD" "$GITHUB_WORKSPACE/smoke-verdict.txt"; then
+            echo "App process died within 30s of launch"
+            exit 1
+          fi
+          SMOKE_EOF
+          chmod +x "$GITHUB_WORKSPACE/smoke-test.sh"
+          ls -l "$GITHUB_WORKSPACE/smoke-test.sh"
+
+      - name: Launch in emulator and capture logcat
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: Nexus 5X
+          ram-size: 4096M
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          script: bash "$GITHUB_WORKSPACE/smoke-test.sh"
+
+      - name: Upload smoke logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: learnharness-emulator-smoke-logs
+          path: |
+            smoke-verdict.txt
+            logcat-crash.txt
+            logcat-app.txt
+          if-no-files-found: warn
+
+      - name: Summarize verdict
+        if: always()
+        run: |
+          {
+            echo "## Emulator smoke verdict"
+            echo ""
+            echo "Verdict: $(cat "$GITHUB_WORKSPACE/smoke-verdict.txt" 2>/dev/null || echo UNKNOWN)"
+            echo ""
+            echo "### Crash buffer"
+            echo '```'
+            head -100 "$GITHUB_WORKSPACE/logcat-crash.txt" 2>/dev/null || echo "(no crash buffer captured)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
