@@ -101,7 +101,8 @@ jobs:
           profile: Nexus 5X
           ram-size: 4096M
           disable-animations: true
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          emulator-boot-timeout: 1800
+          emulator-options: -no-window -gpu auto -noaudio -no-boot-anim
           script: bash "$GITHUB_WORKSPACE/smoke-test.sh"
 
       - name: Upload smoke logs
